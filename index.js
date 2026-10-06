@@ -1,4 +1,4 @@
-﻿const { spawn } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
@@ -157,7 +157,7 @@ end
 local function send_open_alert(position)
   local side = position.side or "UNKNOWN"
 
-  local emoji = side == "LONG" and "🟢" or "🔴"
+  local emoji = side == "LONG" and "??" or "??"
   local side_text = side == "LONG" and "BUY" or "SELL"
 
   local message =
@@ -176,7 +176,7 @@ end
 
 local function send_close_alert(deal)
   local side = deal.deal_side or "UNKNOWN"
-  local emoji = side == "BUY" and "🟢" or "🔴"
+  local emoji = side == "BUY" and "??" or "??"
 
   local reason = reason_from_comment(deal.comment)
 
@@ -306,14 +306,14 @@ function on_message(msg)
   end
 
   if not bot.is_owner(msg.sender) and not bot.is_sudo(msg.sender) then
-    bot.reply(msg.chat, "❌ Owner/Sudo only.", msg.id, msg.sender)
+    bot.reply(msg.chat, "? Owner/Sudo only.", msg.id, msg.sender)
     return
   end
 
   local data = get_status()
 
   if not data then
-    bot.reply(msg.chat, "❌ V2 Monitor API unavailable.", msg.id, msg.sender)
+    bot.reply(msg.chat, "? V2 Monitor API unavailable.", msg.id, msg.sender)
     return
   end
 
@@ -327,7 +327,7 @@ function on_message(msg)
 
   bot.reply(
     msg.chat,
-    "✅ V2 Monitor API connected.\\n\\n" ..
+    "? V2 Monitor API connected.\\n\\n" ..
     "Symbol: XAUUSDr\\n" ..
     "Active V2 positions: " .. tostring(position_count),
     msg.id,
