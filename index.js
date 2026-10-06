@@ -471,6 +471,18 @@ async function generateConfig() {
   }
 
   fs.writeFileSync(configFile, lines.join("\n"));
+
+  console.log("===== GENERATED TCT CONFIG CHECK =====");
+  lines.forEach((line, index) => {
+    let safeLine = line;
+
+    if (/SESSION_ID:/i.test(safeLine)) {
+      safeLine = safeLine.replace(/SESSION_ID:\s*".*"/i, 'SESSION_ID: "***REDACTED***"');
+    }
+
+    console.log(String(index + 1).padStart(3, "0") + " | " + safeLine);
+  });
+  console.log("===== END GENERATED TCT CONFIG CHECK =====");
 }
 
 let child = null;
