@@ -387,7 +387,7 @@ async function generateConfig() {
       )
   );
 
-  const botsIndex = lines.findIndex(line => /^BOTS\\s*:/i.test(line));
+  const botsIndex = lines.findIndex(line => /^\s*BOTS\s*:/i.test(line));
 
   if (botsIndex !== -1) {
     lines = lines.slice(0, botsIndex);
