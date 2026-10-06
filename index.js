@@ -1,4 +1,4 @@
-const { spawn } = require("child_process");
+﻿const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
@@ -107,11 +107,8 @@ async function generateConfig() {
 
   const botsIndex = lines.findIndex(line => /^BOTS\s*:/i.test(line));
   if (botsIndex !== -1) {
-    let endIndex = botsIndex + 1;
-    while (endIndex < lines.length && (lines[endIndex].trim() === "" || lines[endIndex].startsWith(" ") || lines[endIndex].startsWith("-"))) {
-      endIndex++;
-    }
-    lines.splice(botsIndex, endIndex - botsIndex);
+    // Remove the complete template BOTS section.
+    lines = lines.slice(0, botsIndex);
   }
 
   if (process.env.SESSION_ID) {
@@ -221,3 +218,4 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 main();
+
