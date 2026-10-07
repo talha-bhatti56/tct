@@ -1,49 +1,36 @@
-{
+﻿{
   "name": "TCT",
   "description": "A fast WA bot powered by Rust",
   "keywords": [
     "tct",
-    "rust",
     "whatsapp",
     "bot"
   ],
-  "stack": "heroku-24",
-  "buildpacks": [
-    {
-      "url": "heroku/nodejs"
-    }
-  ],
   "env": {
     "SESSION_ID": {
-      "description": "Your WhatsApp session ID(s). (REQUIRED). Use commas to separate multiple sessions (e.g., ID1,ID2)",
+      "description": "Your WhatsApp session ID(s).",
       "value": "",
       "required": true
     },
     "PREFIX": {
-      "description": "Command prefixes (comma separated, leave empty for no prefix)",
+      "description": "Command prefixes.",
       "value": ".",
       "required": false
     },
     "TIMEZONE": {
-      "description": "Your timezone (e.g., Africa/Nairobi, America/New_York)",
-      "value": "Africa/Nairobi",
+      "description": "Your timezone.",
+      "value": "Asia/Karachi",
       "required": false
     },
-    "POSTGRES_URL": {
-      "description": "Full PostgreSQL connection URL. Example: postgresql://username:password@host:5432/database",
+    "MONITOR_API_URL": {
+      "description": "V2 Monitor API URL.",
       "value": "",
       "required": false
     },
-    "POSTGRES_SYNC_INTERVAL": {
-      "description": "Postgres sync interval in seconds. Example: 60 = every 60 seconds",
-      "value": "60",
+    "MONITOR_API_TOKEN": {
+      "description": "V2 Monitor API token.",
+      "value": "",
       "required": false
-    }
-  },
-  "formation": {
-    "web": {
-      "quantity": 1,
-      "size": "basic"
     }
   }
 }
