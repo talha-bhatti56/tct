@@ -1,9 +1,12 @@
+
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
 
 const RESTART_DELAY = 2000;
+const DATA_DIR = process.env.TCT_DATA_DIR || "/data";
+const TCT_DATA_DIR = path.join(DATA_DIR, "data");
 
 const platformMap = {
   linux: "tct-linux",
@@ -12,66 +15,133 @@ const platformMap = {
 };
 
 const binaryName = platformMap[process.platform] || "tct-linux";
-const programPath = path.join(__dirname, binaryName);
+const bundledBinaryPath = path.join(__dirname, binaryName);
+const fallbackBinaryPath = path.join(DATA_DIR, binaryName);
 
-const DOWNLOAD_URL = `https://github.com/i-tct/tct/releases/latest/download/${binaryName}`;
-const CONFIG_TEMPLATE_URL = "https://gist.githubusercontent.com/i-tct/1433de6fbe3a14f2178e5429b46c31c0/raw";
+const DOWNLOAD_URL =
+  `https://github.com/i-tct/tct/releases/latest/download/${binaryName}`;
 
-function downloadFile(url, destPath) {
+const CONFIG_TEMPLATE_URL =
+  "https://gist.githubusercontent.com/i-tct/1433de6fbe3a14f2178e5429b46c31c0/raw";
+
+let programPath = null;
+let child = null;
+let restarting = false;
+let shuttingDown = false;
+
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(TCT_DATA_DIR, { recursive: true });
+
+function downloadFile(url, destPath, redirects = 0) {
   return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
-      if ([301, 302, 307, 308].includes(res.statusCode)) {
-        return downloadFile(res.headers.location, destPath)
+    if (redirects > 10) {
+      return reject(new Error("Too many download redirects"));
+    }
+
+    let parsedUrl;
+
+    try {
+      parsedUrl = new URL(url);
+    } catch (err) {
+      return reject(err);
+    }
+
+    if (parsedUrl.protocol !== "https:") {
+      return reject(new Error("Only HTTPS downloads are allowed"));
+    }
+
+    const request = https.get(parsedUrl, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+        const location = res.headers.location;
+        res.resume();
+
+        if (!location) {
+          return reject(new Error("Redirect did not include a location"));
+        }
+
+        const nextUrl = new URL(location, parsedUrl).toString();
+
+        return downloadFile(nextUrl, destPath, redirects + 1)
           .then(resolve)
           .catch(reject);
       }
 
       if (res.statusCode !== 200) {
-        return reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+        res.resume();
+        return reject(
+          new Error(`Download failed: HTTP ${res.statusCode}`)
+        );
       }
 
       const file = fs.createWriteStream(destPath);
+
       res.pipe(file);
 
       file.on("finish", () => {
-        file.close(() => resolve());
+        file.close((err) => {
+          if (err) return reject(err);
+          resolve();
+        });
       });
 
       file.on("error", (err) => {
+        file.destroy();
         fs.unlink(destPath, () => reject(err));
       });
-    }).on("error", reject);
+
+      res.on("error", (err) => {
+        file.destroy();
+        fs.unlink(destPath, () => reject(err));
+      });
+    });
+
+    request.on("error", reject);
   });
 }
 
-function downloadBinary() {
-  return new Promise((resolve, reject) => {
-    if (fs.existsSync(programPath)) {
-      const stats = fs.statSync(programPath);
+async function downloadBinary() {
+  for (const candidate of [bundledBinaryPath, fallbackBinaryPath]) {
+    if (!fs.existsSync(candidate)) continue;
 
-      if (stats.size > 100000) {
-        return resolve();
+    const stats = fs.statSync(candidate);
+
+    if (stats.isFile() && stats.size > 100000) {
+      programPath = candidate;
+
+      if (process.platform !== "win32") {
+        fs.chmodSync(programPath, 0o755);
       }
 
-      console.log("Binary is corrupted. Re-downloading...");
-      fs.unlinkSync(programPath);
+      console.log(`Using existing TCT binary: ${programPath}`);
+      return;
     }
 
-    console.log(`Downloading fresh binary from: ${DOWNLOAD_URL}`);
+    console.warn(`Ignoring invalid binary file: ${candidate}`);
+  }
 
-    downloadFile(DOWNLOAD_URL, programPath)
-      .then(() => {
-        try {
-          if (process.platform !== "win32") {
-            fs.chmodSync(programPath, 0o755);
-          }
-        } catch {}
+  // /app is read-only on Deplexo. Never download the binary there.
+  if (process.env.TCT_REQUIRE_BUNDLED_BINARY === "true") {
+    throw new Error(
+      "TCT binary is missing from the Docker image. Rebuild the image."
+    );
+  }
 
-        console.log("Binary downloaded successfully.");
-        resolve();
-      })
-      .catch(reject);
-  });
+  console.log(`Downloading TCT binary to writable storage: ${fallbackBinaryPath}`);
+
+  await downloadFile(DOWNLOAD_URL, fallbackBinaryPath);
+
+  const stats = fs.statSync(fallbackBinaryPath);
+
+  if (!stats.isFile() || stats.size <= 100000) {
+    throw new Error("Downloaded TCT binary is invalid or incomplete");
+  }
+
+  if (process.platform !== "win32") {
+    fs.chmodSync(fallbackBinaryPath, 0o755);
+  }
+
+  programPath = fallbackBinaryPath;
+  console.log("TCT binary downloaded successfully.");
 }
 
 function luaEscape(value) {
@@ -87,12 +157,13 @@ function generateMonitorPlugin() {
   const apiToken = process.env.MONITOR_API_TOKEN;
 
   if (!apiUrl || !apiToken) {
-    console.log("V2 Monitor plugin: environment variables not configured.");
+    console.log(
+      "V2 Monitor plugin: environment variables not configured."
+    );
     return;
   }
 
-  const pluginDir = path.join(__dirname, "data", "plugins");
-
+  const pluginDir = path.join(TCT_DATA_DIR, "plugins");
   fs.mkdirSync(pluginDir, { recursive: true });
 
   const pluginPath = path.join(pluginDir, "v2_monitor.lua");
@@ -135,7 +206,6 @@ end
 
 local function reason_from_comment(comment)
   comment = comment or ""
-
   local lower = string.lower(comment)
 
   if string.find(lower, "sl", 1, true) then
@@ -156,7 +226,6 @@ end
 
 local function send_open_alert(position)
   local side = position.side or "UNKNOWN"
-
   local emoji = side == "LONG" and "??" or "??"
   local side_text = side == "LONG" and "BUY" or "SELL"
 
@@ -177,11 +246,8 @@ end
 local function send_close_alert(deal)
   local side = deal.deal_side or "UNKNOWN"
   local emoji = side == "BUY" and "??" or "??"
-
   local reason = reason_from_comment(deal.comment)
-
   local result = tonumber(deal.profit) or 0
-
   local sign = result >= 0 and "+" or ""
 
   local message =
@@ -219,7 +285,9 @@ local function initialize_state(data)
   bot.plugin_store("known_exits", bot.json_encode(exits))
   bot.plugin_store("initialized", "1")
 
-  bot.log_info("V2 Monitor initialized baseline without sending historical alerts.")
+  bot.log_info(
+    "V2 Monitor initialized baseline without sending historical alerts."
+  )
 end
 
 local function load_table(key)
@@ -254,7 +322,6 @@ local function poll_monitor()
 
   local known_positions = load_table("known_positions")
   local known_exits = load_table("known_exits")
-
   local current_positions = {}
 
   if data.positions then
@@ -265,7 +332,9 @@ local function poll_monitor()
 
       if not known_positions[position_id] then
         send_open_alert(position)
-        bot.log_info("V2 Monitor: new position alert sent for " .. position_id)
+        bot.log_info(
+          "V2 Monitor: new position alert sent for " .. position_id
+        )
       end
     end
   end
@@ -277,7 +346,9 @@ local function poll_monitor()
 
         if not known_exits[ticket] then
           send_close_alert(deal)
-          bot.log_info("V2 Monitor: close alert sent for deal " .. ticket)
+          bot.log_info(
+            "V2 Monitor: close alert sent for deal " .. ticket
+          )
           known_exits[ticket] = true
         end
       end
@@ -297,11 +368,7 @@ function on_cron(time)
 end
 
 function on_message(msg)
-  if not msg.command then
-    return
-  end
-
-  if msg.command ~= "v2status" then
+  if not msg.command or msg.command ~= "v2status" then
     return
   end
 
@@ -337,21 +404,25 @@ end
 `;
 
   fs.writeFileSync(pluginPath, plugin, "utf8");
-
-  console.log("V2 Monitor plugin generated.");
+  console.log(`V2 Monitor plugin generated: ${pluginPath}`);
 }
 
 async function generateConfig() {
-  const candidates = ["TCTfile", "tctfile", "tctfile.yml", "config.yml"];
+  const candidates = [
+    "TCTfile",
+    "tctfile",
+    "tctfile.yml",
+    "config.yml"
+  ].map((name) => path.join(DATA_DIR, name));
 
-  let configFile = "tctfile";
+  let configFile = path.join(DATA_DIR, "tctfile");
   let content = "";
   let found = false;
 
-  for (const c of candidates) {
-    if (fs.existsSync(c)) {
-      configFile = c;
-      content = fs.readFileSync(c, "utf8");
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      configFile = candidate;
+      content = fs.readFileSync(candidate, "utf8");
       console.log(`Detected existing config file: ${configFile}`);
       found = true;
       break;
@@ -366,7 +437,7 @@ async function generateConfig() {
       content = fs.readFileSync(configFile, "utf8");
       console.log("Default config template downloaded.");
     } catch (err) {
-      console.error("Failed to download config template:", err);
+      console.error("Failed to download config template:", err.message);
     }
   }
 
@@ -381,13 +452,15 @@ async function generateConfig() {
   ];
 
   lines = lines.filter(
-    line =>
-      !legacyKeys.some(
-        k => new RegExp(`^${k}\\s*:`, "i").test(line)
+    (line) =>
+      !legacyKeys.some((key) =>
+        new RegExp(`^${key}\\s*:`, "i").test(line)
       )
   );
 
-  const botsIndex = lines.findIndex(line => /^\s*BOTS\s*:/i.test(line));
+  const botsIndex = lines.findIndex((line) =>
+    /^\s*BOTS\s*:/i.test(line)
+  );
 
   if (botsIndex !== -1) {
     lines = lines.slice(0, botsIndex);
@@ -399,31 +472,31 @@ async function generateConfig() {
 
     const sessions = process.env.SESSION_ID.split(",");
 
-    for (const s of sessions) {
-      const trimmed = s.trim();
+    for (const session of sessions) {
+      const trimmed = session.trim();
 
-      if (trimmed) {
-        lines.push(`  - SESSION_ID: "${trimmed}"`);
+      if (!trimmed) continue;
 
-        if (process.env.PREFIX) {
-          lines.push(`    PREFIX: "${process.env.PREFIX}"`);
-        }
+      lines.push(`  - SESSION_ID: "${trimmed}"`);
 
-        if (process.env.TIMEZONE) {
-          lines.push(`    TIMEZONE: "${process.env.TIMEZONE}"`);
-        }
+      if (process.env.PREFIX) {
+        lines.push(`    PREFIX: "${process.env.PREFIX}"`);
+      }
 
-        if (process.env.OPENWEATHER_API_KEY) {
-          lines.push(
-            `    OPENWEATHER_API_KEY: "${process.env.OPENWEATHER_API_KEY}"`
-          );
-        }
+      if (process.env.TIMEZONE) {
+        lines.push(`    TIMEZONE: "${process.env.TIMEZONE}"`);
+      }
 
-        if (process.env.MISTRAL_API_KEY) {
-          lines.push(
-            `    MISTRAL_API_KEY: "${process.env.MISTRAL_API_KEY}"`
-          );
-        }
+      if (process.env.OPENWEATHER_API_KEY) {
+        lines.push(
+          `    OPENWEATHER_API_KEY: "${process.env.OPENWEATHER_API_KEY}"`
+        );
+      }
+
+      if (process.env.MISTRAL_API_KEY) {
+        lines.push(
+          `    MISTRAL_API_KEY: "${process.env.MISTRAL_API_KEY}"`
+        );
       }
     }
   }
@@ -433,13 +506,12 @@ async function generateConfig() {
       return;
     }
 
-    const escaped = value
+    const escaped = String(value)
       .replace(/\\/g, "\\\\")
       .replace(/"/g, '\\"');
 
     const newLine = `${key}: "${escaped}"`;
     const regex = new RegExp(`^${key}\\s*:`, "i");
-
     let keyFound = false;
 
     for (let i = 0; i < lines.length; i++) {
@@ -470,74 +542,105 @@ async function generateConfig() {
     forceOverrideEnvVars("SERVER_PORT", dynamicPort);
   }
 
-  fs.writeFileSync(configFile, lines.join("\n"));
+  fs.writeFileSync(configFile, lines.join("\n"), "utf8");
 
   console.log("===== GENERATED TCT CONFIG CHECK =====");
+
   lines.forEach((line, index) => {
     let safeLine = line;
 
     if (/SESSION_ID:/i.test(safeLine)) {
-      safeLine = safeLine.replace(/SESSION_ID:\s*".*"/i, 'SESSION_ID: "***REDACTED***"');
+      safeLine = safeLine.replace(
+        /SESSION_ID:\s*".*"/i,
+        'SESSION_ID: "***REDACTED***"'
+      );
     }
 
-    console.log(String(index + 1).padStart(3, "0") + " | " + safeLine);
+    if (/MONITOR_API_TOKEN/i.test(safeLine)) {
+      safeLine = safeLine.replace(/:.*/, ': "***REDACTED***"');
+    }
+
+    console.log(
+      String(index + 1).padStart(3, "0") + " | " + safeLine
+    );
   });
+
   console.log("===== END GENERATED TCT CONFIG CHECK =====");
 }
 
-let child = null;
-
 async function start() {
+  if (shuttingDown || restarting) return;
+
   try {
-    if (process.platform !== "win32") {
-      fs.chmodSync(programPath, 0o755);
-    }
-  } catch {}
+    await generateConfig();
+    generateMonitorPlugin();
 
-  await generateConfig();
-  generateMonitorPlugin();
+    console.log(`Starting TCT from ${programPath}`);
+    console.log(`TCT working directory: ${DATA_DIR}`);
 
-  console.log("Starting TCT...");
+    child = spawn(programPath, [], {
+      cwd: DATA_DIR,
+      stdio: "inherit",
+      env: process.env
+    });
 
-  child = spawn(programPath, [], {
-    stdio: "inherit",
-    env: process.env
-  });
+    child.on("close", (code, signal) => {
+      console.log(
+        `TCT process exited. Code: ${code}; signal: ${signal || "none"}`
+      );
 
-  child.on("close", (code) => {
-    console.log(`Process exited with code ${code}`);
-    restart();
-  });
+      child = null;
+      scheduleRestart();
+    });
 
-  child.on("error", (err) => {
-    console.error("Failed to start:", err);
-    restart();
-  });
+    child.on("error", (err) => {
+      console.error("Failed to start TCT:", err.message);
+      child = null;
+      scheduleRestart();
+    });
+  } catch (err) {
+    console.error("Startup failed:", err.message);
+    scheduleRestart();
+  }
 }
 
-function restart() {
-  console.log(`Restarting in ${RESTART_DELAY / 1000}s...\\n`);
-  setTimeout(start, RESTART_DELAY);
+function scheduleRestart() {
+  if (shuttingDown || restarting) return;
+
+  restarting = true;
+
+  console.log(`Restarting in ${RESTART_DELAY / 1000}s...`);
+
+  setTimeout(async () => {
+    restarting = false;
+
+    if (!shuttingDown) {
+      await start();
+    }
+  }, RESTART_DELAY);
 }
 
 async function main() {
   try {
     await downloadBinary();
-    start();
+    await start();
   } catch (err) {
-    console.error("Startup failed:", err);
+    console.error("Startup failed:", err.message);
     process.exit(1);
   }
 }
 
 function shutdown() {
-  console.log("\\nShutting down...");
+  if (shuttingDown) return;
+
+  shuttingDown = true;
+  console.log("Shutting down...");
 
   if (child) {
     child.kill("SIGTERM");
   }
 
-  process.exit(0);
+  setTimeout(() => process.exit(0), 1000);
 }
 
 process.on("SIGINT", shutdown);
