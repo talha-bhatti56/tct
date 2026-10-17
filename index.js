@@ -1,4 +1,3 @@
-
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -191,6 +190,9 @@ function luaEscape(value) {
     .replace(/\n/g, "\\n");
 }
 
+// NOTE: emojis inside the generated Lua are written as decimal byte escapes
+// (for example \226\157\140 = a red cross) so this file stays pure ASCII
+// and cannot be corrupted by copy/paste or encoding problems.
 function generateMonitorPlugin() {
   const apiUrl = process.env.MONITOR_API_URL;
   const apiToken = process.env.MONITOR_API_TOKEN;
@@ -265,7 +267,7 @@ end
 
 local function send_open_alert(position)
   local side = position.side or "UNKNOWN"
-  local emoji = side == "LONG" and "🟢" or "🔴"
+  local emoji = side == "LONG" and "\\240\\159\\159\\162" or "\\240\\159\\148\\180"
   local side_text = side == "LONG" and "BUY" or "SELL"
 
   local message =
@@ -284,7 +286,7 @@ end
 
 local function send_close_alert(deal)
   local side = deal.deal_side or "UNKNOWN"
-  local emoji = side == "BUY" and "🟢" or "🔴"
+  local emoji = side == "BUY" and "\\240\\159\\159\\162" or "\\240\\159\\148\\180"
   local reason = reason_from_comment(deal.comment)
   local result = tonumber(deal.profit) or 0
   local sign = result >= 0 and "+" or ""
@@ -412,14 +414,14 @@ function on_message(msg)
   end
 
   if not bot.is_owner(msg.sender) and not bot.is_sudo(msg.sender) then
-    bot.reply(msg.chat, "❌ Owner/Sudo only.", msg.id, msg.sender)
+    bot.reply(msg.chat, "\\226\\157\\140 Owner/Sudo only.", msg.id, msg.sender)
     return
   end
 
   local data = get_status()
 
   if not data then
-    bot.reply(msg.chat, "❌ V2 Monitor API unavailable.", msg.id, msg.sender)
+    bot.reply(msg.chat, "\\226\\157\\140 V2 Monitor API unavailable.", msg.id, msg.sender)
     return
   end
 
@@ -433,7 +435,7 @@ function on_message(msg)
 
   bot.reply(
     msg.chat,
-    "✅ V2 Monitor API connected.\\n\\n" ..
+    "\\226\\156\\133 V2 Monitor API connected.\\n\\n" ..
     "Symbol: XAUUSDr\\n" ..
     "Active V2 positions: " .. tostring(position_count),
     msg.id,
@@ -444,6 +446,60 @@ end
 
   fs.writeFileSync(pluginPath, plugin, "utf8");
   console.log(`V2 Monitor plugin generated: ${pluginPath}`);
+}
+
+// Optional debug plugin. Only created when WHOAMI_DEBUG=1 is set in the
+// environment; otherwise any old copy is removed. It never touches the
+// monitor API or any trade data. It replies with the sender ID the bot sees
+// and whether the bot treats that sender as owner/sudo, and it logs every
+// command it receives so you can see whether messages arrive at all.
+function generateWhoamiPlugin() {
+  const pluginDir = path.join(TCT_DATA_DIR, "plugins");
+  fs.mkdirSync(pluginDir, { recursive: true });
+
+  const whoamiPath = path.join(pluginDir, "whoami_debug.lua");
+
+  if (process.env.WHOAMI_DEBUG !== "1") {
+    try {
+      if (fs.existsSync(whoamiPath)) {
+        fs.unlinkSync(whoamiPath);
+      }
+    } catch {}
+
+    return;
+  }
+
+  const whoamiPlugin = `-- @name: Whoami Debug
+-- @commands: whoami
+-- @global: true
+
+function on_message(msg)
+  if msg.command then
+    bot.log_info(
+      "DEBUG msg: sender=" .. tostring(msg.sender) ..
+      " chat=" .. tostring(msg.chat) ..
+      " command=" .. tostring(msg.command)
+    )
+  end
+
+  if not msg.command or msg.command ~= "whoami" then
+    return
+  end
+
+  bot.reply(
+    msg.chat,
+    "sender: " .. tostring(msg.sender) .. "\\n" ..
+    "bot: " .. tostring(bot.get_bot_jid()) .. "\\n" ..
+    "is_owner: " .. tostring(bot.is_owner(msg.sender)) .. "\\n" ..
+    "is_sudo: " .. tostring(bot.is_sudo(msg.sender)),
+    msg.id,
+    msg.sender
+  )
+end
+`;
+
+  fs.writeFileSync(whoamiPath, whoamiPlugin, "utf8");
+  console.log("Whoami debug plugin enabled (WHOAMI_DEBUG=1).");
 }
 
 async function generateConfig() {
@@ -592,6 +648,7 @@ async function start() {
   try {
     await generateConfig();
     generateMonitorPlugin();
+    generateWhoamiPlugin();
 
     console.log(`Starting TCT from ${programPath}`);
     console.log(`TCT working directory: ${DATA_DIR}`);
