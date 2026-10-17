@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 
-const RESTART_DELAY = 2000;
+const RESTART_DELAY = 5000;
 const DATA_DIR = process.env.TCT_DATA_DIR || "/data";
 const TCT_DATA_DIR = path.join(DATA_DIR, "data");
 
@@ -29,13 +29,29 @@ let child = null;
 let restarting = false;
 let shuttingDown = false;
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(TCT_DATA_DIR, { recursive: true });
+function ensureWritableStorage() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(TCT_DATA_DIR, { recursive: true });
+
+  const testPath = path.join(DATA_DIR, `.write-test-${process.pid}`);
+
+  try {
+    fs.writeFileSync(testPath, "ok");
+    fs.unlinkSync(testPath);
+  } catch (err) {
+    throw new Error(
+      `Storage directory is not writable: ${DATA_DIR}. ${err.message}`
+    );
+  }
+
+  console.log(`Writable storage verified: ${DATA_DIR}`);
+}
 
 function downloadFile(url, destPath, redirects = 0) {
   return new Promise((resolve, reject) => {
     if (redirects > 10) {
-      return reject(new Error("Too many download redirects"));
+      reject(new Error("Too many download redirects"));
+      return;
     }
 
     let parsedUrl;
@@ -43,11 +59,13 @@ function downloadFile(url, destPath, redirects = 0) {
     try {
       parsedUrl = new URL(url);
     } catch (err) {
-      return reject(err);
+      reject(err);
+      return;
     }
 
     if (parsedUrl.protocol !== "https:") {
-      return reject(new Error("Only HTTPS downloads are allowed"));
+      reject(new Error("Only HTTPS downloads are allowed"));
+      return;
     }
 
     const request = https.get(parsedUrl, (res) => {
@@ -56,33 +74,26 @@ function downloadFile(url, destPath, redirects = 0) {
         res.resume();
 
         if (!location) {
-          return reject(new Error("Redirect did not include a location"));
+          reject(new Error("Redirect did not include a location"));
+          return;
         }
 
-        const nextUrl = new URL(location, parsedUrl).toString();
+        downloadFile(
+          new URL(location, parsedUrl).toString(),
+          destPath,
+          redirects + 1
+        ).then(resolve).catch(reject);
 
-        return downloadFile(nextUrl, destPath, redirects + 1)
-          .then(resolve)
-          .catch(reject);
+        return;
       }
 
       if (res.statusCode !== 200) {
         res.resume();
-        return reject(
-          new Error(`Download failed: HTTP ${res.statusCode}`)
-        );
+        reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+        return;
       }
 
       const file = fs.createWriteStream(destPath);
-
-      res.pipe(file);
-
-      file.on("finish", () => {
-        file.close((err) => {
-          if (err) return reject(err);
-          resolve();
-        });
-      });
 
       file.on("error", (err) => {
         file.destroy();
@@ -93,55 +104,83 @@ function downloadFile(url, destPath, redirects = 0) {
         file.destroy();
         fs.unlink(destPath, () => reject(err));
       });
+
+      file.on("finish", () => {
+        file.close((err) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
+      });
+
+      res.pipe(file);
+    });
+
+    request.setTimeout(60000, () => {
+      request.destroy(new Error("Download timed out"));
     });
 
     request.on("error", reject);
   });
 }
 
+function isValidBinary(filePath) {
+  try {
+    const stats = fs.statSync(filePath);
+    return stats.isFile() && stats.size > 100000;
+  } catch {
+    return false;
+  }
+}
+
 async function downloadBinary() {
-  for (const candidate of [bundledBinaryPath, fallbackBinaryPath]) {
-    if (!fs.existsSync(candidate)) continue;
-
-    const stats = fs.statSync(candidate);
-
-    if (stats.isFile() && stats.size > 100000) {
-      programPath = candidate;
-
-      if (process.platform !== "win32") {
-        fs.chmodSync(programPath, 0o755);
-      }
-
-      console.log(`Using existing TCT binary: ${programPath}`);
-      return;
-    }
-
-    console.warn(`Ignoring invalid binary file: ${candidate}`);
+  // The Docker image's bundled binary is read-only.
+  // Never chmod or overwrite the bundled binary.
+  if (isValidBinary(bundledBinaryPath)) {
+    programPath = bundledBinaryPath;
+    console.log(`Using bundled TCT binary: ${programPath}`);
+    return;
   }
 
-  // /app is read-only on Deplexo. Never download the binary there.
   if (process.env.TCT_REQUIRE_BUNDLED_BINARY === "true") {
     throw new Error(
-      "TCT binary is missing from the Docker image. Rebuild the image."
+      "Bundled TCT binary is missing. Check the Dockerfile and rebuild the image."
     );
   }
 
-  console.log(`Downloading TCT binary to writable storage: ${fallbackBinaryPath}`);
+  if (!isValidBinary(fallbackBinaryPath)) {
+    console.log(`Downloading TCT binary to writable storage: ${fallbackBinaryPath}`);
 
-  await downloadFile(DOWNLOAD_URL, fallbackBinaryPath);
+    const temporaryPath = `${fallbackBinaryPath}.download`;
 
-  const stats = fs.statSync(fallbackBinaryPath);
+    try {
+      await downloadFile(DOWNLOAD_URL, temporaryPath);
 
-  if (!stats.isFile() || stats.size <= 100000) {
-    throw new Error("Downloaded TCT binary is invalid or incomplete");
+      if (!isValidBinary(temporaryPath)) {
+        throw new Error("Downloaded TCT binary is invalid or incomplete.");
+      }
+
+      fs.renameSync(temporaryPath, fallbackBinaryPath);
+    } catch (err) {
+      try {
+        if (fs.existsSync(temporaryPath)) {
+          fs.unlinkSync(temporaryPath);
+        }
+      } catch {}
+
+      throw err;
+    }
   }
 
+  // chmod is only used for the writable /data copy.
   if (process.platform !== "win32") {
     fs.chmodSync(fallbackBinaryPath, 0o755);
   }
 
   programPath = fallbackBinaryPath;
-  console.log("TCT binary downloaded successfully.");
+  console.log(`Using writable-storage TCT binary: ${programPath}`);
 }
 
 function luaEscape(value) {
@@ -158,7 +197,7 @@ function generateMonitorPlugin() {
 
   if (!apiUrl || !apiToken) {
     console.log(
-      "V2 Monitor plugin: environment variables not configured."
+      "V2 Monitor plugin not generated: monitor environment variables are missing."
     );
     return;
   }
@@ -226,7 +265,7 @@ end
 
 local function send_open_alert(position)
   local side = position.side or "UNKNOWN"
-  local emoji = side == "LONG" and "??" or "??"
+  local emoji = side == "LONG" and "🟢" or "🔴"
   local side_text = side == "LONG" and "BUY" or "SELL"
 
   local message =
@@ -245,7 +284,7 @@ end
 
 local function send_close_alert(deal)
   local side = deal.deal_side or "UNKNOWN"
-  local emoji = side == "BUY" and "??" or "??"
+  local emoji = side == "BUY" and "🟢" or "🔴"
   local reason = reason_from_comment(deal.comment)
   local result = tonumber(deal.profit) or 0
   local sign = result >= 0 and "+" or ""
@@ -373,14 +412,14 @@ function on_message(msg)
   end
 
   if not bot.is_owner(msg.sender) and not bot.is_sudo(msg.sender) then
-    bot.reply(msg.chat, "? Owner/Sudo only.", msg.id, msg.sender)
+    bot.reply(msg.chat, "❌ Owner/Sudo only.", msg.id, msg.sender)
     return
   end
 
   local data = get_status()
 
   if not data then
-    bot.reply(msg.chat, "? V2 Monitor API unavailable.", msg.id, msg.sender)
+    bot.reply(msg.chat, "❌ V2 Monitor API unavailable.", msg.id, msg.sender)
     return
   end
 
@@ -394,7 +433,7 @@ function on_message(msg)
 
   bot.reply(
     msg.chat,
-    "? V2 Monitor API connected.\\n\\n" ..
+    "✅ V2 Monitor API connected.\\n\\n" ..
     "Symbol: XAUUSDr\\n" ..
     "Active V2 positions: " .. tostring(position_count),
     msg.id,
@@ -438,6 +477,7 @@ async function generateConfig() {
       console.log("Default config template downloaded.");
     } catch (err) {
       console.error("Failed to download config template:", err.message);
+      content = "";
     }
   }
 
@@ -470,9 +510,7 @@ async function generateConfig() {
     lines.push("");
     lines.push("BOTS:");
 
-    const sessions = process.env.SESSION_ID.split(",");
-
-    for (const session of sessions) {
+    for (const session of process.env.SESSION_ID.split(",")) {
       const trimmed = session.trim();
 
       if (!trimmed) continue;
@@ -544,28 +582,8 @@ async function generateConfig() {
 
   fs.writeFileSync(configFile, lines.join("\n"), "utf8");
 
-  console.log("===== GENERATED TCT CONFIG CHECK =====");
-
-  lines.forEach((line, index) => {
-    let safeLine = line;
-
-    if (/SESSION_ID:/i.test(safeLine)) {
-      safeLine = safeLine.replace(
-        /SESSION_ID:\s*".*"/i,
-        'SESSION_ID: "***REDACTED***"'
-      );
-    }
-
-    if (/MONITOR_API_TOKEN/i.test(safeLine)) {
-      safeLine = safeLine.replace(/:.*/, ': "***REDACTED***"');
-    }
-
-    console.log(
-      String(index + 1).padStart(3, "0") + " | " + safeLine
-    );
-  });
-
-  console.log("===== END GENERATED TCT CONFIG CHECK =====");
+  // Do not print the generated config: it contains the WhatsApp session.
+  console.log(`TCT config generated: ${configFile}`);
 }
 
 async function start() {
@@ -584,17 +602,17 @@ async function start() {
       env: process.env
     });
 
+    child.on("error", (err) => {
+      console.error("Failed to start TCT:", err.message);
+      child = null;
+      scheduleRestart();
+    });
+
     child.on("close", (code, signal) => {
       console.log(
         `TCT process exited. Code: ${code}; signal: ${signal || "none"}`
       );
 
-      child = null;
-      scheduleRestart();
-    });
-
-    child.on("error", (err) => {
-      console.error("Failed to start TCT:", err.message);
       child = null;
       scheduleRestart();
     });
@@ -608,7 +626,6 @@ function scheduleRestart() {
   if (shuttingDown || restarting) return;
 
   restarting = true;
-
   console.log(`Restarting in ${RESTART_DELAY / 1000}s...`);
 
   setTimeout(async () => {
@@ -622,10 +639,11 @@ function scheduleRestart() {
 
 async function main() {
   try {
+    ensureWritableStorage();
     await downloadBinary();
     await start();
   } catch (err) {
-    console.error("Startup failed:", err.message);
+    console.error("Fatal startup error:", err.message);
     process.exit(1);
   }
 }
